@@ -6,7 +6,7 @@ Third party code: side chain packing uses helper functions from [Openfold](https
 
 ### Running the code
 ```
-git clone https://github.com/dauparas/LigandMPNN.git
+git clone https://github.com/horstl/LigandMPNN.git
 cd LigandMPNN
 bash get_model_params.sh "./model_params"
 
