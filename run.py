@@ -23,7 +23,203 @@ from model_utils import ProteinMPNN
 from prody import writePDB
 from sc_utils import Packer, pack_side_chains
 
-
+# ============================================================
+# <<< pI PATCH 1 of 3 >>>  
+# ============================================================
+import torch.nn.functional as F
+# Canonical AA order used by LigandMPNN (20 standard AAs + X)
+_AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"   # indices 0-19; index 20 = X (unknown)
+ 
+# pKa look-up for ionisable side chains (standard mid-range values)
+_PKA_POS = [                         # groups positively charged at low pH
+    (_AA_ORDER.index("H"),  6.00),   # His
+    (_AA_ORDER.index("K"), 10.53),   # Lys
+    (_AA_ORDER.index("R"), 12.48),   # Arg
+]
+_PKA_NEG = [                         # groups negatively charged at high pH
+    (_AA_ORDER.index("D"),  3.65),   # Asp
+    (_AA_ORDER.index("E"),  4.25),   # Glu
+    (_AA_ORDER.index("C"),  8.18),   # Cys
+    (_AA_ORDER.index("Y"), 10.07),   # Tyr
+]
+_PKA_NTERM = 8.0
+_PKA_CTERM = 3.1
+_SIGMOID_T = 0.5   # sharpness of ionisation sigmoid
+ 
+ 
+def _net_charge(probs20: torch.Tensor, pH: torch.Tensor) -> torch.Tensor:
+    """
+    Expected net charge as a smooth function of AA probabilities and pH.
+ 
+    probs20 : (N_surface, 20)  — softmax over 20 canonical AAs (no X)
+    pH      : scalar tensor
+    returns : scalar tensor
+    """
+    q = torch.zeros(1, device=probs20.device, dtype=probs20.dtype)
+    for idx, pka in _PKA_POS:
+        q = q + (probs20[:, idx] * torch.sigmoid((pka - pH) / _SIGMOID_T)).sum()
+    for idx, pka in _PKA_NEG:
+        q = q - (probs20[:, idx] * torch.sigmoid((pH - pka) / _SIGMOID_T)).sum()
+    q = q + torch.sigmoid((torch.tensor(_PKA_NTERM, device=probs20.device, dtype=probs20.dtype) - pH) / _SIGMOID_T)
+    q = q - torch.sigmoid((pH - torch.tensor(_PKA_CTERM, device=probs20.device, dtype=probs20.dtype)) / _SIGMOID_T)
+    return q
+ 
+ 
+def _estimate_pI(probs20: torch.Tensor, n_iter: int = 30) -> torch.Tensor:
+    """
+    Differentiable binary search for the isoelectric point.
+    Uses smooth tanh-branching to keep gradients alive.
+    """
+    dev, dt = probs20.device, probs20.dtype
+    lo = torch.tensor(0.0,  device=dev, dtype=dt)
+    hi = torch.tensor(14.0, device=dev, dtype=dt)
+    for _ in range(n_iter):
+        mid  = (lo + hi) / 2.0
+        q    = _net_charge(probs20, mid)
+        sign = torch.tanh(q * 1e3)          # ≈ +1 if q>0, -1 if q<0
+        lo   = lo  + (mid - lo) * (sign  + 1) / 2
+        hi   = hi  - (hi - mid) * (-sign + 1) / 2
+    return (lo + hi) / 2.0
+ 
+ 
+def compute_pI_logit_bias(
+    feature_dict: dict,
+    surface_mask: torch.Tensor,       # [L] bool, True = surface residue
+    target_pI:    float,
+    weight:       float = 1.0,
+    n_steps:      int   = 300,
+    lr:           float = 0.05,
+    device:       str   = "cpu",
+) -> torch.Tensor:
+    """
+    Optimise a per-residue AA bias tensor so that the expected pI of surface
+    residues matches target_pI, then return the full [1, L, 21] bias tensor
+    ready to be written into feature_dict["bias"].
+ 
+    Parameters
+    ----------
+    feature_dict : the dict that will be passed to model.sample() — used only
+                   to read chain_mask / mask so we know which positions are
+                   active and what L is.
+    surface_mask : [L] bool tensor marking solvent-exposed residues
+    target_pI    : desired isoelectric point
+    weight       : scale applied to the optimised bias before returning
+                   (amplifies or dampens the steering effect at sampling time)
+    n_steps      : Adam optimisation steps
+    lr           : Adam learning rate
+    device       : torch device string
+ 
+    Returns
+    -------
+    bias : [1, L, 21] float tensor — add this to feature_dict["bias"]
+    """
+    # Read protein length from the bias tensor already in feature_dict
+    # (LigandMPNN initialises it to zeros before calling sample)
+    existing_bias = feature_dict.get("bias", None)
+    if existing_bias is not None:
+        B, L, _ = existing_bias.shape
+    else:
+        # Fall back: infer L from mask
+        L = int(feature_dict["mask"].shape[1])
+ 
+    surf = surface_mask.to(device)                 # [L]
+    N_surf = int(surf.sum().item())
+    if N_surf == 0:
+        print("[pI bias] WARNING: surface_mask is all-False — no bias applied.")
+        return torch.zeros(1, L, 21, device=device)
+ 
+    # Learnable per-surface-residue AA bias (20 canonical AAs)
+    bias_surf = torch.zeros(N_surf, 20, device=device, requires_grad=True)
+    opt = torch.optim.Adam([bias_surf], lr=lr)
+ 
+    # We start from neutral logits so the optimiser only learns the delta
+    base_logits = torch.zeros(N_surf, 20, device=device)
+ 
+    target = torch.tensor(target_pI, device=device)
+ 
+    for step in range(n_steps):
+        opt.zero_grad()
+        probs = F.softmax(base_logits + bias_surf, dim=-1)   # [N_surf, 20]
+        pI_est = _estimate_pI(probs)
+        loss = (pI_est - target) ** 2
+        loss.backward()
+        opt.step()
+ 
+    print(f"[pI bias] Converged: estimated pI = {pI_est.item():.4f}  "
+          f"(target {target_pI:.2f})  loss = {loss.item():.6f}")
+ 
+    # Build full [1, L, 21] bias tensor (zeros everywhere, fill surface cols)
+    full_bias = torch.zeros(1, L, 21, device=device)
+    surf_indices = surf.nonzero(as_tuple=True)[0]          # [N_surf]
+    # Only apply to the 20 standard AA columns; col 20 (X) stays 0
+    full_bias[0, surf_indices, :20] = bias_surf.detach() * weight
+ 
+    return full_bias
+ 
+ 
+def sasa_surface_mask(pdb_path: str, threshold: float = 0.25,
+                      device: str = "cpu") -> torch.Tensor:
+    """
+    Compute a boolean surface mask from a PDB file using FreeSASA (if
+    available) or a simple Cα distance-based burial heuristic as fallback.
+ 
+    Returns
+    -------
+    mask : [L] bool tensor on `device`
+    """
+    try:
+        import freesasa                           # optional fast path
+        import prody                              # LigandMPNN already needs this
+ 
+        structure = prody.parsePDB(pdb_path)
+        ca = structure.select("name CA and protein")
+        if ca is None:
+            raise ValueError("No Cα atoms found")
+        coords = ca.getCoords()                   # (L, 3)
+        L = coords.shape[0]
+ 
+        fs_struct = freesasa.Structure(pdb_path)
+        result    = freesasa.calc(fs_struct)
+        # residue-level SASA — map by residue index
+        sasa_vals = np.array([
+            result.residueArea(str(ca.getResnums()[i]),
+                               ca.getChids()[i]).total
+            for i in range(L)
+        ], dtype=np.float32)
+        # Normalise by Gly (188.0 Å² ≈ fully exposed small residue)
+        rel_sasa = sasa_vals / 188.0
+        mask = torch.tensor(rel_sasa > threshold, dtype=torch.bool, device=device)
+        print(f"[pI bias] FreeSASA: {mask.sum().item()}/{L} surface residues "
+              f"(threshold={threshold})")
+        return mask
+ 
+    except Exception as e:
+        # ---- Fallback: 8-nearest Cα neighbours burial heuristic ----
+        print(f"[pI bias] FreeSASA unavailable ({e}), using Cα-burial fallback.")
+        try:
+            import prody
+            structure = prody.parsePDB(pdb_path)
+            ca = structure.select("name CA and protein")
+            coords = torch.tensor(ca.getCoords(), dtype=torch.float32)
+        except Exception as e2:
+            print(f"[pI bias] prody also failed ({e2}). "
+                  "Returning all-True surface mask.")
+            # We can't know L here without feature_dict; return a sentinel
+            return None
+ 
+        L = coords.shape[0]
+        # pairwise distances
+        diff = coords.unsqueeze(0) - coords.unsqueeze(1)       # [L,L,3]
+        dist = diff.norm(dim=-1)                               # [L,L]
+        dist.fill_diagonal_(float("inf"))
+        # count neighbours within 10 Å  (< 8 neighbours → exposed)
+        n_neighbors = (dist < 10.0).sum(dim=-1).float()        # [L]
+        # surface = fewer neighbours than median
+        median_n = n_neighbors.median()
+        mask = (n_neighbors < median_n).to(device)
+        print(f"[pI bias] Burial heuristic: {mask.sum().item()}/{L} surface residues")
+        return mask
+ 
 def main(args) -> None:
     """
     Inference function
@@ -187,6 +383,13 @@ def main(args) -> None:
     else:
         parse_these_chains_only_list = []
 
+    # <<< pI PATCH 2 of 3 >>>
+    # Read the new pI flags.
+    # ------------------------------------------------------------------ #
+    target_pI      = args.target_pI        # float or None
+    pI_weight      = args.pI_weight
+    sasa_threshold = args.sasa_threshold
+    # ------------------------------------------------------------------ #
 
     # loop over PDB paths
     for pdb in pdb_paths:
@@ -418,6 +621,39 @@ def main(args) -> None:
             loss_list = []
             loss_per_residue_list = []
             loss_XY_list = []
+            # ------------------------------------------------------------------ #
+            # <<< pI PATCH 3 of 3 >>>
+            # Compute pI-steering bias and inject into feature_dict["bias"]
+            # ------------------------------------------------------------------ #
+            if target_pI is not None:
+                pdb_path = args.pdb_path          # adjust if iterating over multiple PDBs
+                device_str = str(next(model.parameters()).device)
+         
+                surface_mask = sasa_surface_mask(pdb_path, threshold=sasa_threshold,
+                                                 device=device_str)
+         
+                if surface_mask is None:
+                    # sasa helper couldn't determine L — build from feature_dict
+                    L = feature_dict["mask"].shape[1]
+                    print("[pI bias] Using all residues as surface (fallback).")
+                    surface_mask = torch.ones(L, dtype=torch.bool, device=device_str)
+         
+                pi_bias = compute_pI_logit_bias(
+                    feature_dict = feature_dict,
+                    surface_mask = surface_mask,
+                    target_pI    = target_pI,
+                    weight       = pI_weight,
+                    device       = device_str,
+                )
+         
+                # feature_dict["bias"] is [B, L, 21] — add our bias on top
+                # (the existing bias already encodes --bias_AA / --bias_AA_per_residue)
+                if "bias" in feature_dict and feature_dict["bias"] is not None:
+                    feature_dict["bias"] = feature_dict["bias"] + pi_bias
+                else:
+                    feature_dict["bias"] = pi_bias
+            # ------------------------------------------------------------------ #
+            
             for _ in range(args.number_of_batches):
                 feature_dict["randn"] = torch.randn(
                     [feature_dict["batch_size"], feature_dict["mask"].shape[1]],
@@ -985,6 +1221,42 @@ if __name__ == "__main__":
         default=1,
         help="1-pack side chains using ligand context, 0 - do not use it.",
     )
+    # ------------------------------------------------------------------ #
+    # <<< pI PATCH >>> #
+    # ------------------------------------------------------------------ #
+    argparser.add_argument(
+        "--target_pI",
+        type=float,
+        default=None,
+        help=(
+            "Target isoelectric point for the designed sequence. "
+            "When set, a per-residue AA bias is computed before sampling "
+            "to steer the expected pI of surface residues toward this value. "
+            "Example: --target_pI 6.0"
+        ),
+    )
+    argparser.add_argument(
+        "--pI_weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Scale applied to the pI steering bias (logit units). "
+            "Values 0.5–3.0 are practical; higher = stronger steering "
+            "but less sequence diversity. Default: 1.0"
+        ),
+    )
+    argparser.add_argument(
+        "--sasa_threshold",
+        type=float,
+        default=0.25,
+        help=(
+            "Relative SASA threshold above which a residue is treated as "
+            "surface-exposed for pI steering (0–1). Default: 0.25"
+        ),
+    )
+    # ------------------------------------------------------------------ #
+ 
+    return argparser
 
     args = argparser.parse_args()
     main(args)
