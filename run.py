@@ -4,6 +4,8 @@ import json
 import os.path
 import random
 import sys
+import math 
+import freesasa
 
 import numpy as np
 import torch
@@ -30,195 +32,312 @@ import torch.nn.functional as F
 # Canonical AA order used by LigandMPNN (20 standard AAs + X)
 _AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"   # indices 0-19; index 20 = X (unknown)
  
-# pKa look-up for ionisable side chains (standard mid-range values)
+# pKa look-up for ionisable side chains from
+#  https://ipc2.mimuw.edu.pl/theory.html / https://academic.oup.com/nar/article/49/W1/W285/6255695
+'''
 _PKA_POS = [                         # groups positively charged at low pH
-    (_AA_ORDER.index("H"),  6.00),   # His
-    (_AA_ORDER.index("K"), 10.53),   # Lys
-    (_AA_ORDER.index("R"), 12.48),   # Arg
+    (_AA_ORDER.index("H"),  5.492),   # His
+    (_AA_ORDER.index("K"), 9.247),   # Lys
+    (_AA_ORDER.index("R"), 10.223),   # Arg
 ]
 _PKA_NEG = [                         # groups negatively charged at high pH
-    (_AA_ORDER.index("D"),  3.65),   # Asp
-    (_AA_ORDER.index("E"),  4.25),   # Glu
-    (_AA_ORDER.index("C"),  8.18),   # Cys
-    (_AA_ORDER.index("Y"), 10.07),   # Tyr
+    (_AA_ORDER.index("D"),  3.799),   # Asp
+    (_AA_ORDER.index("E"),  4.497),   # Glu
+    (_AA_ORDER.index("C"),  7.89),   # Cys
+    (_AA_ORDER.index("Y"), 11.491),   # Tyr
+]
+_PKA_NTERM = 5.779
+_PKA_CTERM = 6.065
+'''
+_PKA_POS = [
+    (_AA_ORDER.index("H"),  6.0),
+    (_AA_ORDER.index("K"), 10.5),
+    (_AA_ORDER.index("R"), 12.5),
+]
+_PKA_NEG = [
+    (_AA_ORDER.index("D"),  3.9),
+    (_AA_ORDER.index("E"),  4.07),
+    (_AA_ORDER.index("C"),  8.18),
+    (_AA_ORDER.index("Y"), 10.1),
 ]
 _PKA_NTERM = 8.0
-_PKA_CTERM = 3.1
-_SIGMOID_T = 0.5   # sharpness of ionisation sigmoid
+_PKA_CTERM = 3.65
+_SIGMOID_T = 1 / math.log(10)    # sharpness of ionisation sigmoid,  Henderson-Hasselbalch formula
  
+# Background distribution of natural amino acids (Uniprot frequencies, order = _AA_ORDER)
+_AA_FREQ_VALUES = [
+    0.08, 0.02, 0.05, 0.06, 0.04,
+    0.07, 0.02, 0.06, 0.07, 0.09,
+    0.02, 0.04, 0.05, 0.04, 0.05,
+    0.07, 0.06, 0.01, 0.03, 0.06
+]
  
-def _net_charge(probs20: torch.Tensor, pH: torch.Tensor) -> torch.Tensor:
+
+_BIOPYTHON_PKA = {
+    # (positive groups: charge +1 below pKa)
+    "K":  10.5,
+    "R":  12.5,
+    "H":   6.0,
+    # (negative groups: charge -1 above pKa)  
+    "D":   3.9,
+    "E":   4.07,
+    "C":   8.18,
+    "Y":  10.1,
+    # termini
+    "NT":  8.0,
+    "CT":  3.65,
+}
+def _biopython_charge(probs: torch.Tensor, pH: torch.Tensor) -> torch.Tensor:
     """
-    Expected net charge as a smooth function of AA probabilities and pH.
- 
-    probs20 : (N_surface, 20)  — softmax over 20 canonical AAs (no X)
-    pH      : scalar tensor
-    returns : scalar tensor
+    Exact BioPython charge model — matches isoelectric_point() output.
+    probs: [L, 20], pH: scalar
+    Uses BioPython convention: cr = 10**(pKa-pH) / (1 + 10**(pKa-pH)) for positive groups
     """
-    q = torch.zeros(1, device=probs20.device, dtype=probs20.dtype)
-    for idx, pka in _PKA_POS:
-        q = q + (probs20[:, idx] * torch.sigmoid((pka - pH) / _SIGMOID_T)).sum()
-    for idx, pka in _PKA_NEG:
-        q = q - (probs20[:, idx] * torch.sigmoid((pH - pka) / _SIGMOID_T)).sum()
-    q = q + torch.sigmoid((torch.tensor(_PKA_NTERM, device=probs20.device, dtype=probs20.dtype) - pH) / _SIGMOID_T)
-    q = q - torch.sigmoid((pH - torch.tensor(_PKA_CTERM, device=probs20.device, dtype=probs20.dtype)) / _SIGMOID_T)
+    log10 = math.log(10)
+    q = torch.zeros(1, device=probs.device, dtype=probs.dtype)
+    
+    # Positive groups (protonated = charged at low pH)
+    for aa, pka in [("K", 10.5), ("R", 12.5), ("H", 6.0)]:
+        idx = _AA_ORDER.index(aa)
+        # BioPython: cr = 10^(pKa-pH) / (1 + 10^(pKa-pH)) = sigmoid((pKa-pH)*log10)
+        cr = torch.sigmoid((pka - pH) * log10)
+        q = q + (probs[:, idx] * cr).sum()
+    
+    # Negative groups (deprotonated = charged at high pH)
+    for aa, pka in [("D", 3.9), ("E", 4.07), ("C", 8.18), ("Y", 10.1)]:
+        idx = _AA_ORDER.index(aa)
+        cr = torch.sigmoid((pH - pka) * log10)
+        q = q - (probs[:, idx] * cr).sum()
+    
+    # Termini (once per chain)
+    q = q + torch.sigmoid((8.0  - pH) * log10)   # N-term
+    q = q - torch.sigmoid((pH  - 3.65) * log10)  # C-term
+    
     return q
  
  
 def _estimate_pI(probs20: torch.Tensor, n_iter: int = 30) -> torch.Tensor:
     """
     Differentiable binary search for the isoelectric point.
-    Uses smooth tanh-branching to keep gradients alive.
+    Uses smooth tanh-branching so gradients flow back through the bisection
+    without needing create_graph or higher-order autograd.
     """
     dev, dt = probs20.device, probs20.dtype
     lo = torch.tensor(0.0,  device=dev, dtype=dt)
     hi = torch.tensor(14.0, device=dev, dtype=dt)
     for _ in range(n_iter):
         mid  = (lo + hi) / 2.0
-        q    = _net_charge(probs20, mid)
-        sign = torch.tanh(q * 1e3)          # ≈ +1 if q>0, -1 if q<0
-        lo   = lo  + (mid - lo) * (sign  + 1) / 2
-        hi   = hi  - (hi - mid) * (-sign + 1) / 2
+        q    = _biopython_charge(probs20, mid)
+        # tanh(q*1e3) ≈ sign(q): +1 when q>0 (pI above mid), -1 when q<0
+        sign = torch.tanh(q * 1e3)
+        lo   = lo  + (mid - lo) * ( sign + 1) / 2   # lo → mid when q > 0
+        hi   = hi  - (hi - mid) * (-sign + 1) / 2   # hi → mid when q < 0
     return (lo + hi) / 2.0
- 
- 
+
+def _charge_from_counts(counts, pH):
+    log10 = math.log(10)
+    q = torch.zeros(1, device=counts.device, dtype=counts.dtype)
+    for aa, pka in [("K",10.5),("R",12.5),("H",6.0)]:
+        idx = _AA_ORDER.index(aa)
+        q = q + counts[idx] * torch.sigmoid((pka - pH) * log10)
+    for aa, pka in [("D",3.9),("E",4.07),("C",8.18),("Y",10.1)]:
+        idx = _AA_ORDER.index(aa)
+        q = q - counts[idx] * torch.sigmoid((pH - pka) * log10)
+    q = q + torch.sigmoid((8.0  - pH) * log10)
+    q = q - torch.sigmoid((pH - 3.65) * log10)
+    return q
+
+
 def compute_pI_logit_bias(
     feature_dict: dict,
-    surface_mask: torch.Tensor,       # [L] bool, True = surface residue
+    surface_weights: torch.Tensor,
     target_pI:    float,
     weight:       float = 1.0,
-    n_steps:      int   = 300,
-    lr:           float = 0.05,
+    n_steps:      int   = 400,
+    lr:           float = 0.2,
     device:       str   = "cpu",
+    base_logits_full=None,
 ) -> torch.Tensor:
     """
-    Optimise a per-residue AA bias tensor so that the expected pI of surface
-    residues matches target_pI, then return the full [1, L, 21] bias tensor
-    ready to be written into feature_dict["bias"].
- 
-    Parameters
-    ----------
-    feature_dict : the dict that will be passed to model.sample() — used only
-                   to read chain_mask / mask so we know which positions are
-                   active and what L is.
-    surface_mask : [L] bool tensor marking solvent-exposed residues
-    target_pI    : desired isoelectric point
-    weight       : scale applied to the optimised bias before returning
-                   (amplifies or dampens the steering effect at sampling time)
-    n_steps      : Adam optimisation steps
-    lr           : Adam learning rate
-    device       : torch device string
- 
-    Returns
-    -------
-    bias : [1, L, 21] float tensor — add this to feature_dict["bias"]
+    Optimise a per-residue AA logit bias so that the expected AA composition
+    (measured via _charge_from_counts, identical to BioPython) hits target_pI.
+
+    Key design decisions
+    --------------------
+    1. Loss is on expected INTEGER counts (probs.sum(0)), not soft per-residue
+       distributions — this is what BioPython actually measures.
+    2. base_logits reflects the MODEL's actual preferences (passed in from
+       feature_dict["bias"] existing values), so the bias is computed relative
+       to what the model would sample without intervention.
+    3. No bias_l2 penalty — it was suppressing the bias below the level needed
+       to compete with the model's strong prior for this protein.
+    4. KL regularisation is kept very weak (0.001) and uses the model prior,
+       not the uniform prior, so it only penalises biologically unreasonable
+       deviations.
+    5. His is capped at 8% (was 5%, too tight — His is a valid surface residue).
     """
-    # Read protein length from the bias tensor already in feature_dict
-    # (LigandMPNN initialises it to zeros before calling sample)
     existing_bias = feature_dict.get("bias", None)
     if existing_bias is not None:
         B, L, _ = existing_bias.shape
     else:
-        # Fall back: infer L from mask
         L = int(feature_dict["mask"].shape[1])
- 
-    surf = surface_mask.to(device)                 # [L]
-    N_surf = int(surf.sum().item())
-    if N_surf == 0:
-        print("[pI bias] WARNING: surface_mask is all-False — no bias applied.")
-        return torch.zeros(1, L, 21, device=device)
- 
-    # Learnable per-surface-residue AA bias (20 canonical AAs)
-    bias_surf = torch.zeros(N_surf, 20, device=device, requires_grad=True)
-    opt = torch.optim.Adam([bias_surf], lr=lr)
- 
-    # We start from neutral logits so the optimiser only learns the delta
-    base_logits = torch.zeros(N_surf, 20, device=device)
- 
-    target = torch.tensor(target_pI, device=device)
- 
+
+    w = surface_weights.to(device)          # [L] rSASA weights in [0,1]
+    w_loss = 0.2 + 0.8 * w                  # floor at 0.2 so buried residues contribute
+    w_sum  = w_loss.sum().clamp(min=1e-6)
+
+    # base_logits: use the model's existing bias as the reference point so the
+    # optimiser learns the *delta* needed relative to the model's preferences.
+    # If the existing bias encodes strong K/R preference (native pI 8.93),
+    # the optimiser must work against it explicitly.
+    if base_logits_full is not None:
+        base_logits = base_logits_full.clone().detach().to(device)  # [L, 20]
+    elif existing_bias is not None:
+        # Use existing bias[:, :, :20] as the reference logit frame
+        base_logits = existing_bias[0, :, :20].clone().detach().to(device)  # [L, 20]
+    else:
+        base_logits = torch.zeros(L, 20, device=device)
+
+    bias_all = torch.zeros(L, 20, device=device, requires_grad=True)
+    opt = torch.optim.Adam([bias_all], lr=lr)
+
+    pH_target = torch.tensor(target_pI, device=device, dtype=torch.float32)
+
     for step in range(n_steps):
         opt.zero_grad()
-        probs = F.softmax(base_logits + bias_surf, dim=-1)   # [N_surf, 20]
-        pI_est = _estimate_pI(probs)
-        loss = (pI_est - target) ** 2
+
+        # Probabilities in the biased model's reference frame
+        probs      = F.softmax(base_logits + bias_all, dim=-1)          # [L, 20]
+        #prior_probs = F.softmax(base_logits, dim=-1).detach()            # [L, 20]
+        p_nat = torch.tensor(_AA_FREQ_VALUES, device=device, dtype=torch.float32)
+        p_nat = p_nat / p_nat.sum()                              # normalise to sum=1
+        #prior_probs = p_nat.unsqueeze(0).expand(L, -1)   
+        prior_probs = F.softmax(base_logits, dim=-1).detach() 
+
+        # ── 1. pI loss on expected counts (= BioPython-equivalent) ──────────
+        # rSASA-weighted expected counts: surface residues contribute more
+        weighted_counts = (w_loss.unsqueeze(-1) * probs).sum(0)          # [20]
+        # Normalise to true expected counts (scale back to L residues)
+        expected_counts = weighted_counts * (L / w_sum)                  # [20]
+
+        # Bisection on counts — same maths as BioPython isoelectric_point()
+        lo_c = torch.tensor(0.0,  device=device, dtype=torch.float32)
+        hi_c = torch.tensor(14.0, device=device, dtype=torch.float32)
+        for _ in range(30):
+            mid_c = (lo_c + hi_c) / 2
+            q_c   = _charge_from_counts(expected_counts, mid_c)
+            s_c   = torch.tanh(q_c * 1e3)
+            lo_c  = lo_c + (mid_c - lo_c) * (s_c + 1) / 2
+            hi_c  = hi_c - (hi_c - mid_c) * (-s_c + 1) / 2
+        pI_est_train = (lo_c + hi_c) / 2
+        pI_loss = (pI_est_train - pH_target) ** 2
+
+        # ── 2. KL toward model prior (very weak — just prevents wild sequences) 
+        kl_loss = (w_loss * torch.sum(
+            probs * torch.log((probs + 1e-8) / (prior_probs + 1e-8)), dim=-1
+        )).sum() / w_sum
+
+        # ── 3. Ionisable floor: keep at least 25% DEKRH on surface positions ─
+        ionisable_idx = [_AA_ORDER.index(aa) for aa in "DEKRH"]
+        ionisable_frac = (w_loss * probs[:, ionisable_idx].sum(-1)).sum() / w_sum
+        ionisable_penalty = F.relu(0.25 - ionisable_frac) ** 2
+
+
+        # ── 4. His cap at 3%  / Cys cap at 2% - natural distribution — prevents His from being used as a free buffer ─
+        his_frac    = (w_loss * probs[:, _AA_ORDER.index("H")]).sum() / w_sum
+        his_penalty = F.relu(his_frac - 0.03) ** 2
+        cys_frac = (w_loss * probs[:, _AA_ORDER.index("C")]).sum() / w_sum
+        cys_penalty = F.relu(cys_frac - 0.02) ** 2   # cap Cys at 2% (natural ~2%)
+
+        loss = pI_loss + 0.05 * kl_loss + 20.0 * ionisable_penalty + 50.0 * his_penalty + 50.00 * cys_penalty
         loss.backward()
         opt.step()
- 
-    print(f"[pI bias] Converged: estimated pI = {pI_est.item():.4f}  "
-          f"(target {target_pI:.2f})  loss = {loss.item():.6f}")
- 
-    # Build full [1, L, 21] bias tensor (zeros everywhere, fill surface cols)
+
+        if step % 100 == 0:
+            print(f"  step {step:3d}: pI_counts={pI_est_train.item():.4f}  "
+                  f"loss={loss.item():.6f}  bias_max={bias_all.abs().max().item():.4f}")
+
+    # ── Reporting ────────────────────────────────────────────────────────────
+    with torch.no_grad():
+        probs_final     = F.softmax(base_logits + bias_all, dim=-1)
+        weighted_counts = (w_loss.unsqueeze(-1) * probs_final).sum(0)
+        expected_counts = weighted_counts * (L / w_sum)
+
+        # BioPython cross-check
+        from Bio.SeqUtils.ProtParam import ProteinAnalysis
+        seq_approx = "".join(aa * max(1, int(expected_counts[i].round()))
+                             for i, aa in enumerate(_AA_ORDER))
+        pa = ProteinAnalysis(seq_approx)
+        bp_pI = pa.isoelectric_point()
+
+        # Our bisection on same counts
+        lo_r = torch.tensor(0.0, device=device, dtype=torch.float32)
+        hi_r = torch.tensor(14.0, device=device, dtype=torch.float32)
+        for _ in range(30):
+            mid_r = (lo_r + hi_r) / 2
+            q_r   = _charge_from_counts(expected_counts, mid_r)
+            s_r   = torch.tanh(q_r * 1e3)
+            lo_r  = lo_r + (mid_r - lo_r) * (s_r + 1) / 2
+            hi_r  = hi_r - (hi_r - mid_r) * (-s_r + 1) / 2
+        pI_report = ((lo_r + hi_r) / 2).item()
+
+        print("\n[DIAG] Expected AA counts (rSASA-weighted, scaled to L):")
+        for i, aa in enumerate(_AA_ORDER):
+            if expected_counts[i] > expected_counts.mean() * 1.1:
+                tag = " ▲"
+            elif expected_counts[i] < expected_counts.mean() * 0.9:
+                tag = " ▼"
+            else:
+                tag = ""
+            print(f"  {aa}: {expected_counts[i]:.1f}{tag}")
+        print(f"[DIAG] BioPython pI of expected composition : {bp_pI:.4f}")
+        print(f"[DIAG] Our count-based pI estimate          : {pI_report:.4f}")
+        print(f"[DIAG] Target                               : {target_pI:.4f}")
+        print(f"[pI bias] bias_max = {bias_all.abs().max().item():.4f} logit units  "
+              f"(effective at sampling = {bias_all.abs().max().item() * weight:.4f})")
+
     full_bias = torch.zeros(1, L, 21, device=device)
-    surf_indices = surf.nonzero(as_tuple=True)[0]          # [N_surf]
-    # Only apply to the 20 standard AA columns; col 20 (X) stays 0
-    full_bias[0, surf_indices, :20] = bias_surf.detach() * weight
- 
+    full_bias[0, :, :20] = bias_all.detach() * weight
     return full_bias
  
  
-def sasa_surface_mask(pdb_path: str, threshold: float = 0.25,
-                      device: str = "cpu") -> torch.Tensor:
-    """
-    Compute a boolean surface mask from a PDB file using FreeSASA (if
-    available) or a simple Cα distance-based burial heuristic as fallback.
- 
-    Returns
-    -------
-    mask : [L] bool tensor on `device`
-    """
-    try:
-        import freesasa                           # optional fast path
-        import prody                              # LigandMPNN already needs this
- 
-        structure = prody.parsePDB(pdb_path)
-        ca = structure.select("name CA and protein")
-        if ca is None:
-            raise ValueError("No Cα atoms found")
-        coords = ca.getCoords()                   # (L, 3)
-        L = coords.shape[0]
- 
-        fs_struct = freesasa.Structure(pdb_path)
-        result    = freesasa.calc(fs_struct)
-        # residue-level SASA — map by residue index
-        sasa_vals = np.array([
-            result.residueArea(str(ca.getResnums()[i]),
-                               ca.getChids()[i]).total
-            for i in range(L)
-        ], dtype=np.float32)
-        # Normalise by Gly (188.0 Å² ≈ fully exposed small residue)
-        rel_sasa = sasa_vals / 188.0
-        mask = torch.tensor(rel_sasa > threshold, dtype=torch.bool, device=device)
-        print(f"[pI bias] FreeSASA: {mask.sum().item()}/{L} surface residues "
-              f"(threshold={threshold})")
-        return mask
- 
-    except Exception as e:
-        # ---- Fallback: 8-nearest Cα neighbours burial heuristic ----
-        print(f"[pI bias] FreeSASA unavailable ({e}), using Cα-burial fallback.")
-        try:
-            import prody
-            structure = prody.parsePDB(pdb_path)
-            ca = structure.select("name CA and protein")
-            coords = torch.tensor(ca.getCoords(), dtype=torch.float32)
-        except Exception as e2:
-            print(f"[pI bias] prody also failed ({e2}). "
-                  "Returning all-True surface mask.")
-            # We can't know L here without feature_dict; return a sentinel
-            return None
- 
-        L = coords.shape[0]
-        # pairwise distances
-        diff = coords.unsqueeze(0) - coords.unsqueeze(1)       # [L,L,3]
-        dist = diff.norm(dim=-1)                               # [L,L]
-        dist.fill_diagonal_(float("inf"))
-        # count neighbours within 10 Å  (< 8 neighbours → exposed)
-        n_neighbors = (dist < 10.0).sum(dim=-1).float()        # [L]
-        # surface = fewer neighbours than median
-        median_n = n_neighbors.median()
-        mask = (n_neighbors < median_n).to(device)
-        print(f"[pI bias] Burial heuristic: {mask.sum().item()}/{L} surface residues")
-        return mask
+# max SASA values (Tien et al. 2013)
+MAX_SASA = {
+    'A': 121, 'C': 148, 'D': 187, 'E': 214, 'F': 228,
+    'G': 97,  'H': 216, 'I': 195, 'K': 230, 'L': 191,
+    'M': 203, 'N': 187, 'P': 154, 'Q': 214, 'R': 265,
+    'S': 143, 'T': 163, 'V': 165, 'W': 264, 'Y': 255
+}
+
+def compute_rsasa_weights(pdb_file, device="cpu"):
+    structure = freesasa.Structure(pdb_file)
+    result = freesasa.calc(structure)
+
+    areas = result.residueAreas()
+
+    rsasa = []
+    for chain in areas:
+        for resnum in areas[chain]:
+            res = areas[chain][resnum]
+
+            aa = res.residueType.strip()
+            if aa not in MAX_SASA:
+                rsasa.append(0.0)
+                continue
+
+            sasa = res.total
+            rsasa_val = sasa / MAX_SASA[aa]
+
+            rsasa.append(min(rsasa_val, 1.0))
+
+    # convert to tensor before sigmoid (np.ndarray is not accepted by torch.sigmoid)
+    rsasa = torch.tensor(np.array(rsasa), dtype=torch.float32, device=device)
+
+    # smooth weighting: below 25% exposure → mostly ignored (0.1 weight), above → increasingly important, if turned off 
+    # it would not properply calculate the pI
+    weights = 0.1 + 0.9 * torch.sigmoid((rsasa - 0.25) * 8)
+
+    return weights
  
 def main(args) -> None:
     """
@@ -621,39 +740,59 @@ def main(args) -> None:
             loss_list = []
             loss_per_residue_list = []
             loss_XY_list = []
+
             # ------------------------------------------------------------------ #
             # <<< pI PATCH 3 of 3 >>>
             # Compute pI-steering bias and inject into feature_dict["bias"]
             # ------------------------------------------------------------------ #
             if target_pI is not None:
-                pdb_path = args.pdb_path          # adjust if iterating over multiple PDBs
                 device_str = str(next(model.parameters()).device)
-         
-                surface_mask = sasa_surface_mask(pdb_path, threshold=sasa_threshold,
-                                                 device=device_str)
-         
-                if surface_mask is None:
-                    # sasa helper couldn't determine L — build from feature_dict
-                    L = feature_dict["mask"].shape[1]
-                    print("[pI bias] Using all residues as surface (fallback).")
-                    surface_mask = torch.ones(L, dtype=torch.bool, device=device_str)
-         
-                pi_bias = compute_pI_logit_bias(
-                    feature_dict = feature_dict,
-                    surface_mask = surface_mask,
-                    target_pI    = target_pI,
-                    weight       = pI_weight,
-                    device       = device_str,
-                )
-         
-                # feature_dict["bias"] is [B, L, 21] — add our bias on top
-                # (the existing bias already encodes --bias_AA / --bias_AA_per_residue)
-                if "bias" in feature_dict and feature_dict["bias"] is not None:
-                    feature_dict["bias"] = feature_dict["bias"] + pi_bias
-                else:
-                    feature_dict["bias"] = pi_bias
+
+                # bug fix: use `pdb` (current loop variable), not args.pdb_path
+                surface_weights = compute_rsasa_weights(pdb, device=device_str)
+
+                if len(surface_weights) != L:
+                    print(f"WARNING: SASA computation returned {len(surface_weights)} "
+                          f"weights but expected {L} residues. Falling back to uniform weights.")
+                    surface_weights = torch.ones(L, dtype=torch.float32, device=device_str)
+
+                base_logits_full = None
+
+                with torch.enable_grad():
+                    # Step 1: one unbiased forward pass to get the model's actual
+                    # per-position sampling distribution as base logits.
+                    with torch.no_grad():
+                        tmp_feature_dict = {k: v.clone() if torch.is_tensor(v) else v
+                                            for k, v in feature_dict.items()}
+                        tmp_feature_dict["bias"] = torch.zeros_like(feature_dict["bias"])
+                        tmp_feature_dict["temperature"] = 1.0
+                        # randn is required by model.sample() for the decoding order
+                        tmp_feature_dict["randn"] = torch.randn(
+                            [feature_dict["batch_size"], feature_dict["mask"].shape[1]],
+                            device=device,
+                        )
+                        tmp_out = model.sample(tmp_feature_dict)
+                        # sampling_probs is [B, L, 21] — full per-position distribution.
+                        # log_probs is [B, L] scalar (log-prob of sampled token only) — wrong.
+                        base_logits_full = torch.log(
+                            tmp_out["sampling_probs"][0, :, :20].clamp(min=1e-8)
+                        )  # [L, 20]
+
+                    # Step 2: optimise the pI bias relative to these base logits.
+                    pi_bias = compute_pI_logit_bias(
+                        feature_dict     = feature_dict,
+                        surface_weights  = surface_weights,
+                        target_pI        = target_pI,
+                        weight           = pI_weight,
+                        base_logits_full = base_logits_full,
+                        device           = device_str,
+                    )
+
+                # detach so model.sample() sees a plain tensor with no grad_fn
+                feature_dict["bias"] = (feature_dict["bias"] + pi_bias).detach()
             # ------------------------------------------------------------------ #
-            
+
+            # Sampling loop — inside no_grad like the rest of inference
             for _ in range(args.number_of_batches):
                 feature_dict["randn"] = torch.randn(
                     [feature_dict["batch_size"], feature_dict["mask"].shape[1]],
@@ -802,10 +941,10 @@ def main(args) -> None:
                         rec_stack[ix].cpu().numpy(), unique=False, precision=4
                     )
                     loss_np = np.format_float_positional(
-                        np.exp(-loss_stack[ix].cpu().numpy()), unique=False, precision=4
+                        np.exp(-loss_stack[ix].detach().cpu().numpy()), unique=False, precision=4
                     )
                     loss_XY_np = np.format_float_positional(
-                        np.exp(-loss_XY_stack[ix].cpu().numpy()),
+                        loss_XY_stack[ix].detach().cpu().numpy(),
                         unique=False,
                         precision=4,
                     )
@@ -818,7 +957,7 @@ def main(args) -> None:
                         None,
                     ].repeat(4, 1)
                     bfactor_prody = (
-                        loss_per_residue_stack[ix].cpu().numpy()[None, :].repeat(4, 1)
+                        loss_per_residue_stack[ix].detach().cpu().numpy()[None, :].repeat(4, 1)
                     )
                     backbone.setResnames(seq_prody)
                     backbone.setBetas(
@@ -929,31 +1068,31 @@ if __name__ == "__main__":
     argparser.add_argument(
         "--checkpoint_protein_mpnn",
         type=str,
-        default="./model_params/proteinmpnn_v_48_020.pt",
+        default="/home/hole11/software/LigandMPNN_pI/model_params/proteinmpnn_v_48_020.pt",
         help="Path to model weights.",
     )
     argparser.add_argument(
         "--checkpoint_ligand_mpnn",
         type=str,
-        default="./model_params/ligandmpnn_v_32_010_25.pt",
+        default="/home/hole11/software/LigandMPNN_pI/model_params/ligandmpnn_v_32_010_25.pt",
         help="Path to model weights.",
     )
     argparser.add_argument(
         "--checkpoint_per_residue_label_membrane_mpnn",
         type=str,
-        default="./model_params/per_residue_label_membrane_mpnn_v_48_020.pt",
+        default="/home/hole11/software/LigandMPNN_pI/model_params/per_residue_label_membrane_mpnn_v_48_020.pt",
         help="Path to model weights.",
     )
     argparser.add_argument(
         "--checkpoint_global_label_membrane_mpnn",
         type=str,
-        default="./model_params/global_label_membrane_mpnn_v_48_020.pt",
+        default="/home/hole11/software/LigandMPNN_pI/model_params/global_label_membrane_mpnn_v_48_020.pt",
         help="Path to model weights.",
     )
     argparser.add_argument(
         "--checkpoint_soluble_mpnn",
         type=str,
-        default="./model_params/solublempnn_v_48_020.pt",
+        default="/home/hole11/software/LigandMPNN_pI/model_params/solublempnn_v_48_020.pt",
         help="Path to model weights.",
     )
 
@@ -1169,7 +1308,7 @@ if __name__ == "__main__":
     argparser.add_argument(
         "--checkpoint_path_sc",
         type=str,
-        default="./model_params/ligandmpnn_sc_v_32_002_16.pt",
+        default="/home/hole11/software/LigandMPNN_pI/model_params/ligandmpnn_sc_v_32_002_16.pt",
         help="Path to model weights.",
     )
 
@@ -1255,8 +1394,7 @@ if __name__ == "__main__":
         ),
     )
     # ------------------------------------------------------------------ #
- 
-    return argparser
+#    return argparser
 
     args = argparser.parse_args()
     main(args)
